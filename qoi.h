@@ -289,6 +289,46 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* ---- Near-lossless extension -----------------------------------------------
+
+The functions below are an optional extension. The regular qoi_encode() /
+qoi_decode() functions and the byte stream they produce are unchanged.
+
+Near-lossless encoding first quantizes every channel of every pixel onto a
+uniform grid; the quantized image is then compressed with the ordinary,
+unmodified QOI encoder. Any standard QOI decoder can therefore read a
+near-lossless file. The grid step is (2 * tolerance + 1), so without dithering
+the absolute per-channel error is provably <= tolerance.
+
+- tolerance: 0 selects the exact lossless path. qoi_encode_near() then returns
+  a byte-for-byte identical stream to qoi_encode() for the same input.
+  Valid range is 0..127.
+- dither: 0 = plain grid quantization (hard error bound); 1 = Floyd-Steinberg
+  error diffusion (visually smoother, average error lower).
+- record_error: 0 = discard the quantization residuals, smallest output.
+  1 = append the signed per-channel residuals in a trailer after the regular
+  QOI end marker. Standard decoders ignore the trailer; qoi_decode_near()
+  reads it back and reconstructs the original pixels exactly. */
+
+typedef struct {
+	unsigned char tolerance;     /* grid quantization tolerance, 0..127 */
+	unsigned char dither;        /* 0 = no dither, 1 = Floyd-Steinberg */
+	unsigned char record_error;  /* 0 = drop residuals, 1 = store them */
+} qoi_nl_desc;
+
+/* Near-lossless counterpart of qoi_encode(). The qoi_desc argument and the
+return value semantics are identical to qoi_encode(). */
+
+void *qoi_encode_near(const void *data, const qoi_desc *desc,
+	const qoi_nl_desc *nl, int *out_len);
+
+/* Counterpart of qoi_decode(). If the stream carries a residual trailer it is
+applied and the original, pre-quantization pixels are returned. Streams
+without a trailer decode exactly like qoi_decode(). */
+
+void *qoi_decode_near(const void *data, int size, qoi_desc *desc, int channels);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -584,6 +624,282 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 		if (channels == 4) {
 			pixels[px_pos + 3] = px.rgba.a;
 		}
+	}
+
+	return pixels;
+}
+
+/* ---- Near-lossless extension implementation ----------------------------- */
+
+/* Magic of the residual trailer: the 4 bytes "QNLR", stored big-endian. */
+#define QOI_NL_MAGIC \
+	(((unsigned int)'Q') << 24 | ((unsigned int)'N') << 16 | \
+	 ((unsigned int)'L') <<  8 | ((unsigned int)'R'))
+
+/* Clamp an integer into the unsigned char range. */
+static unsigned char qoi_nl_clamp(int v) {
+	if (v < 0) { return 0; }
+	if (v > 255) { return 255; }
+	return (unsigned char)v;
+}
+
+/* Quantize one channel value onto the grid of step (2*t+1). Rounding to the
+nearest grid point and clamping the result guarantees
+|original - quantized| <= t for every input. */
+static unsigned char qoi_nl_quantize(unsigned char v, int t) {
+	int step = 2 * t + 1;
+	int q = ((int)v + t) / step * step;
+	return qoi_nl_clamp(q);
+}
+
+void *qoi_encode_near(const void *data, const qoi_desc *desc,
+	const qoi_nl_desc *nl, int *out_len
+) {
+	const unsigned char *pixels;
+	unsigned char *work, *out, *residuals;
+	int i, channels, px_len, t, dither, record_error;
+	int res_count, res_cap, base_len, total;
+	unsigned int checksum;
+
+	if (
+		data == NULL || out_len == NULL || desc == NULL || nl == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width ||
+		nl->tolerance > 127
+	) {
+		return NULL;
+	}
+
+	/* tolerance 0 is the exact lossless path: delegate to the unmodified
+	encoder so the output is byte-for-byte identical to qoi_encode(). */
+	if (nl->tolerance == 0) {
+		return qoi_encode(data, desc, out_len);
+	}
+
+	t = nl->tolerance;
+	dither = nl->dither ? 1 : 0;
+	record_error = nl->record_error ? 1 : 0;
+	channels = desc->channels;
+	px_len = (int)(desc->width * desc->height) * channels;
+
+	work = (unsigned char *) QOI_MALLOC((size_t)px_len);
+	if (!work) {
+		return NULL;
+	}
+	memcpy(work, data, (size_t)px_len);
+	pixels = (const unsigned char *)data;
+
+	res_cap = record_error ? px_len : 0;
+	residuals = record_error
+		? (unsigned char *) QOI_MALLOC((size_t)res_cap)
+		: NULL;
+	if (record_error && !residuals) {
+		QOI_FREE(work);
+		return NULL;
+	}
+	res_count = 0;
+
+	if (!dither) {
+		/* Plain grid quantization, one channel at a time. */
+		for (i = 0; i < px_len; i++) {
+			unsigned char q = qoi_nl_quantize(pixels[i], t);
+			if (record_error) {
+				residuals[res_count++] = (unsigned char)(pixels[i] - q);
+			}
+			work[i] = q;
+		}
+	}
+	else {
+		/* Floyd-Steinberg error diffusion, classic single-pixel sweep.
+		err[] has one slot per column (plus a guard column) and holds the
+		accumulated error destined for the row below, in 16.16 fixed point.
+		carry[] holds the 7/16 contribution from the left neighbor of the
+		current row; it is per channel so errors can never leak across
+		channels. After a column is consumed its slot is cleared and reused
+		for the row below. */
+		int width = (int)desc->width;
+		int height = (int)desc->height;
+		int *err;
+		int carry[4];
+		int y, x, c;
+
+		err = (int *) QOI_MALLOC(
+			(size_t)(width + 1) * channels * sizeof(int));
+		if (!err) {
+			QOI_FREE(residuals);
+			QOI_FREE(work);
+			return NULL;
+		}
+		memset(err, 0, (size_t)(width + 1) * channels * sizeof(int));
+
+		for (y = 0; y < height; y++) {
+			for (c = 0; c < channels; c++) {
+				carry[c] = 0; /* first column has no left neighbor */
+			}
+			for (x = 0; x < width; x++) {
+				int row = (y * width + x) * channels;
+				for (c = 0; c < channels; c++) {
+					int slot = x * channels + c;
+					int orig = pixels[row + c];
+					int adj = orig + ((err[slot] + carry[c]) >> 16);
+					unsigned char q =
+						qoi_nl_quantize(qoi_nl_clamp(adj), t);
+					int e = adj - (int)q; /* quantization error, |e| <= t */
+
+					if (record_error) {
+						residuals[res_count++] =
+							(unsigned char)(orig - (int)q);
+					}
+					work[row + c] = q;
+
+					/* Standard Floyd-Steinberg weights: 7/16 right,
+					3/16 below-left, 5/16 below, 1/16 below-right. */
+					carry[c] = e * 7;
+					err[slot] = 0; /* slot consumed; reuse for next row */
+					if (y + 1 < height) {
+						if (x > 0) {
+							err[slot - channels] += e * 3;
+						}
+						err[slot] += e * 5;
+						err[slot + channels] += e * 1; /* guard column */
+					}
+				}
+			}
+		}
+		QOI_FREE(err);
+	}
+
+	/* Compress the quantized pixels with the regular, unmodified encoder. */
+	out = (unsigned char *) qoi_encode(work, desc, &base_len);
+	QOI_FREE(work);
+	if (!out) {
+		QOI_FREE(residuals);
+		return NULL;
+	}
+
+	if (!record_error) {
+		*out_len = base_len;
+		return out;
+	}
+
+	/* Append: "QNLR" | uint32 residual count | residuals | uint32 checksum.
+	The trailer sits behind the standard 0x00*7,0x01 end marker, so any
+	ordinary QOI decoder stops before it. */
+	total = base_len + 4 + 4 + res_count + 4;
+	{
+		unsigned char *grown = (unsigned char *) QOI_MALLOC((size_t)total);
+		if (!grown) {
+			QOI_FREE(out);
+			QOI_FREE(residuals);
+			return NULL;
+		}
+		memcpy(grown, out, (size_t)base_len);
+		QOI_FREE(out);
+		out = grown;
+	}
+
+	i = base_len;
+	qoi_write_32(out, &i, QOI_NL_MAGIC);
+	qoi_write_32(out, &i, (unsigned int)res_count);
+	memcpy(out + i, residuals, (size_t)res_count);
+	i += res_count;
+
+	checksum = 0;
+	{
+		int k;
+		for (k = 0; k < res_count; k++) {
+			checksum = checksum * 31u + residuals[k];
+		}
+	}
+	qoi_write_32(out, &i, checksum);
+	QOI_FREE(residuals);
+
+	*out_len = total;
+	return out;
+}
+
+void *qoi_decode_near(const void *data, int size, qoi_desc *desc, int channels) {
+	const unsigned char *bytes;
+	unsigned char *pixels;
+	int p, m, px_len, out_channels, trailer_pos, res_start, i;
+	int have_trailer;
+	unsigned int magic, res_count, checksum, expect;
+
+	/* First decode the standard stream (ignores any trailing bytes). */
+	pixels = (unsigned char *) qoi_decode(data, size, desc, channels);
+	if (!pixels) {
+		return NULL;
+	}
+
+	bytes = (const unsigned char *)data;
+	if (channels == 0) {
+		out_channels = desc->channels;
+	}
+	else {
+		out_channels = channels;
+	}
+	px_len = (int)(desc->width * desc->height) * out_channels;
+
+	/* Find the residual trailer. A candidate is an end-marker-like byte
+	sequence (7x 0x00, 1x 0x01) immediately followed by the "QNLR" magic;
+	every candidate is fully validated (magic, length, checksum) because the
+	residual payload could itself contain marker-like bytes. Candidates are
+	scanned front-to-back so the genuine stream end marker - which precedes
+	any trailer bytes - is reached before look-alikes inside the payload.
+	The first valid candidate wins; if none validates, the file is treated
+	as an ordinary near-lossless / lossless stream and the quantized pixels
+	are returned. */
+	have_trailer = 0;
+	res_start = 0;
+	for (m = 0; m + 8 <= size && !have_trailer; m++) {
+		if (!(
+			bytes[m] == 0 && bytes[m+1] == 0 && bytes[m+2] == 0 &&
+			bytes[m+3] == 0 && bytes[m+4] == 0 && bytes[m+5] == 0 &&
+			bytes[m+6] == 0 && bytes[m+7] == 1
+		)) {
+			continue;
+		}
+
+		trailer_pos = m + 8;
+		if (trailer_pos + 8 > size) {
+			continue;
+		}
+		p = trailer_pos;
+		magic = qoi_read_32(bytes, &p);
+		if (magic != QOI_NL_MAGIC) {
+			continue;
+		}
+		res_count = qoi_read_32(bytes, &p);
+		if ((int)res_count != px_len || p + (int)res_count + 4 > size) {
+			continue;
+		}
+
+		checksum = 0;
+		for (i = 0; i < (int)res_count; i++) {
+			checksum = checksum * 31u + bytes[p + i];
+		}
+		{
+			int checksum_pos = p + (int)res_count;
+			expect = qoi_read_32(bytes, &checksum_pos);
+		}
+		if (checksum != expect) {
+			continue;
+		}
+
+		have_trailer = 1;
+		res_start = p;
+	}
+
+	if (!have_trailer) {
+		return pixels; /* no valid trailer: quantized pixels are the result */
+	}
+
+	/* Reconstruct the original pixels. Residuals are stored as unsigned
+	(original - quantized); addition wraps safely in unsigned char. */
+	for (i = 0; i < px_len; i++) {
+		pixels[i] = (unsigned char)(pixels[i] + bytes[res_start + i]);
 	}
 
 	return pixels;
