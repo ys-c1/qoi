@@ -289,6 +289,78 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* -----------------------------------------------------------------------------
+QBA - Block-adaptive extension (experimental, lossless)
+
+QBA wraps an image into independently coded horizontal bands of
+`block_height` rows. Each block is analyzed for complexity (number of
+distinct colors, longest pixel run) and one of three codings is selected per
+block: raw copy, run-length or palette index. A per-block header records the
+mode, payload length and a CRC-8 checksum, so a corrupted block header can be
+detected; the decoder then resynchronizes on the next block marker, skips
+the damaged block and continues with the remaining blocks.
+
+The original qoi_* functions and the QOI byte stream are not affected. */
+
+#define QBA_MAGIC      0x71626131u /* "qba1" */
+#define QBA_VERSION    1
+#define QBA_END_MARKER 0x51424145u /* "QBAE" */
+
+#define QBA_MODE_RAW   0
+#define QBA_MODE_RLE   1
+#define QBA_MODE_INDEX 2
+
+#define QBA_BLOCK_HEADER_SIZE 10  /* 'Q','B',mode,blocknum,len(4 BE),crc8 */
+
+/* Configuration for block-adaptive coding. Pass NULL to qba_encode() for the
+defaults. block_height is the band height in rows (>= 1). The decision uses
+two thresholds against block statistics:
+  maxrun - longest run of identical pixels
+  ndist  - number of distinct colors in the block
+    maxrun >= rle_threshold              -> QBA_MODE_RLE
+    ndist  <= index_colors_threshold     -> QBA_MODE_INDEX
+    otherwise                            -> QBA_MODE_RAW
+index_colors_threshold must be in 1..255 (palette indices are one byte). */
+
+typedef struct {
+	unsigned int block_height;            /* rows per block, default 16    */
+	unsigned int rle_threshold;           /* default 4                     */
+	unsigned int index_colors_threshold;  /* default 32, range 1..255      */
+} qba_config;
+
+/* Per-image statistics, filled by qba_decode() when a non-NULL pointer is
+supplied. mode_counts[m] counts blocks coded with mode m, corrupted_blocks
+counts block headers that failed the CRC-8 / sanity checks and were skipped,
+and header_bytes is the total on-disk size spent on block headers. */
+
+typedef struct {
+	unsigned int total_blocks;
+	unsigned int mode_counts[3];
+	unsigned int corrupted_blocks;
+	unsigned int header_bytes;
+} qba_stats;
+
+/* Fill *cfg with the library defaults. */
+
+void qba_default_config(qba_config *cfg);
+
+/* Encode raw RGB/RGBA pixels into a QBA stream in memory. Returns NULL on
+failure; *out_len receives the stream size. The returned buffer must be
+free()d. */
+
+void *qba_encode(const void *data, const qoi_desc *desc,
+	const qba_config *cfg, int *out_len);
+
+/* Decode a QBA stream. Pixels of skipped (corrupt header) blocks are filled
+with the sentinel color (magenta, {255,0,255,255}); the function still
+returns the full pixel buffer. Returns NULL only on hard failure (bad
+parameters, bad container header, malloc failure). If stats is non-NULL it
+is zeroed and filled with per-image coding statistics. */
+
+void *qba_decode(const void *data, int size, qoi_desc *desc, int channels,
+	qba_stats *stats);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -646,4 +718,654 @@ void *qoi_read(const char *filename, qoi_desc *desc, int channels) {
 }
 
 #endif /* QOI_NO_STDIO */
+
+
+/* -----------------------------------------------------------------------------
+QBA implementation - block-adaptive coding
+
+Container layout (all multi-byte integers big-endian):
+
+  container header, 24 bytes:
+    0..3   magic "qba1"
+    4      version (1)
+    5      channels (3 or 4)
+    6      colorspace (0 or 1, informative)
+    7..10  width
+    11..14 height
+    15..18 block_height (rows per block)
+    19..20 rle_threshold (u16)
+    21..22 index_colors_threshold (u16)
+    23     reserved (0)
+
+  any number of block headers + payloads:
+    block header, 10 bytes:
+      0..1   marker 'Q','B'
+      2      mode (0 = raw, 1 = rle, 2 = index)
+      3..4   block number (u16, starting at 0)
+      5..8   payload length in bytes (u32)
+      9      crc-8 (poly 0x07, init 0) over bytes 0..8
+
+    raw payload:   width*blockrows*channels raw pixel bytes
+    rle payload:   packbits-style control stream over whole pixels
+                     control c >= 0: c+1 literal pixels follow
+                     control c <  0: 1-c copies of the one pixel that follows
+    index payload: 1 byte color count minus 1, then the palette (count *
+                   channels bytes), then one palette index byte per pixel
+
+  end marker, 8 bytes: "QBAE" followed by 4 zero bytes
+*/
+
+#define QBA_CONTAINER_HEADER_SIZE 24
+#define QBA_CONTAINER_END_SIZE    8
+#define QBA_BLOCKS_MAX            65535u
+
+static unsigned int qba_pixel_key(const unsigned char *px, int channels) {
+	if (channels == 4) {
+		return (unsigned int)px[0] | ((unsigned int)px[1] << 8) |
+			((unsigned int)px[2] << 16) | ((unsigned int)px[3] << 24);
+	}
+	return (unsigned int)px[0] | ((unsigned int)px[1] << 8) |
+		((unsigned int)px[2] << 16);
+}
+
+static unsigned char qba_crc8(const unsigned char *p, int n) {
+	static const unsigned char poly = 0x07;
+	unsigned char crc = 0;
+	int i, j;
+	for (i = 0; i < n; i++) {
+		crc = (unsigned char)(crc ^ p[i]);
+		for (j = 0; j < 8; j++) {
+			if (crc & 0x80) {
+				crc = (unsigned char)((crc << 1) ^ poly);
+			}
+			else {
+				crc = (unsigned char)(crc << 1);
+			}
+		}
+	}
+	return crc;
+}
+
+static void qba_write_32(unsigned char *b, unsigned int v) {
+	b[0] = (unsigned char)((v >> 24) & 0xff);
+	b[1] = (unsigned char)((v >> 16) & 0xff);
+	b[2] = (unsigned char)((v >> 8) & 0xff);
+	b[3] = (unsigned char)(v & 0xff);
+}
+
+static unsigned int qba_read_32(const unsigned char *b) {
+	return ((unsigned int)b[0] << 24) | ((unsigned int)b[1] << 16) |
+		((unsigned int)b[2] << 8) | (unsigned int)b[3];
+}
+
+/* Count distinct colors (capped at 256: anything beyond cannot use palette
+indexing) and the longest run of identical pixels. */
+
+static void qba_analyze_block(const unsigned char *px, int channels, int npix,
+	unsigned int *out_ndist, unsigned int *out_maxrun) {
+	unsigned int seen[256];
+	unsigned int ndist = 0;
+	unsigned int maxrun = 0;
+	unsigned int run = 0;
+	unsigned int prev_key = 0;
+	int i;
+
+	for (i = 0; i < npix; i++) {
+		unsigned int key = qba_pixel_key(px + (size_t)i * channels, channels);
+		unsigned int j;
+		int found = 0;
+
+		if (i == 0 || key != prev_key) {
+			if (run > maxrun) { maxrun = run; }
+			run = 1;
+			prev_key = key;
+		}
+		else {
+			run++;
+		}
+
+		if (ndist < 256) {
+			for (j = 0; j < ndist; j++) {
+				if (seen[j] == key) { found = 1; break; }
+			}
+			if (!found) {
+				seen[ndist] = key;
+				ndist++;
+			}
+		}
+	}
+	if (run > maxrun) { maxrun = run; }
+
+	*out_ndist = ndist;
+	*out_maxrun = maxrun;
+}
+
+/* Packbits-style run/literal coding over whole pixels. Returns payload size. */
+
+static int qba_rle_encode(const unsigned char *src, int npix, int channels,
+	unsigned char *out) {
+	int p = 0;
+	int o = 0;
+
+	while (p < npix) {
+		int run = 1;
+		while (
+			p + run < npix && run < 128 &&
+			memcmp(src + (size_t)(p + run) * channels,
+				src + (size_t)p * channels, channels) == 0
+		) {
+			run++;
+		}
+
+		if (run >= 2) {
+			out[o++] = (unsigned char)(1 - run); /* -(run-1) */
+			memcpy(out + o, src + (size_t)p * channels, channels);
+			o += channels;
+			p += run;
+		}
+		else {
+			int start = p;
+			int lit = 0;
+			while (p < npix && lit < 128) {
+				if (
+					p + 1 < npix &&
+					memcmp(src + (size_t)p * channels,
+						src + (size_t)(p + 1) * channels, channels) == 0
+				) {
+					break;
+				}
+				p++;
+				lit++;
+			}
+			if (lit == 0) { /* safety valve, normally unreachable */
+				out[o++] = 0;
+				memcpy(out + o, src + (size_t)p * channels, channels);
+				o += channels;
+				p++;
+			}
+			else {
+				out[o++] = (unsigned char)(lit - 1);
+				memcpy(out + o, src + (size_t)start * channels,
+					(size_t)lit * channels);
+				o += lit * channels;
+			}
+		}
+	}
+	return o;
+}
+
+static int qba_rle_decode(const unsigned char *in, int in_len, int channels,
+	int npix, unsigned char *out) {
+	int p = 0;
+	int o = 0;
+
+	while (o < npix) {
+		int c, n, i;
+		if (p >= in_len) { return -1; }
+		c = (signed char)in[p++];
+
+		if (c >= 0) {
+			n = c + 1;
+			if (o + n > npix || p + n * channels > in_len) { return -1; }
+			memcpy(out + (size_t)o * channels, in + p,
+				(size_t)n * channels);
+			p += n * channels;
+			o += n;
+		}
+		else {
+			n = 1 - c;
+			if (o + n > npix || p + channels > in_len) { return -1; }
+			for (i = 0; i < n; i++) {
+				memcpy(out + (size_t)o * channels, in + p, channels);
+				o++;
+			}
+			p += channels;
+		}
+	}
+	return (p == in_len) ? 0 : -1;
+}
+
+/* Palette coding. Returns payload size, 0 if the block has > 255 colors. */
+
+static int qba_index_encode(const unsigned char *src, int npix, int channels,
+	unsigned int ndist, unsigned char *out) {
+	unsigned int palette[256];
+	int ncolors = 0;
+	int o = 0;
+	int i, k;
+
+	if (ndist > 255) { return 0; }
+	out[o++] = (unsigned char)(ndist - 1);
+
+	for (i = 0; i < npix; i++) {
+		unsigned int key = qba_pixel_key(src + (size_t)i * channels, channels);
+		int found = -1;
+		for (k = 0; k < ncolors; k++) {
+			if (palette[k] == key) { found = k; break; }
+		}
+		if (found < 0) {
+			if (ncolors == 256) { return 0; }
+			palette[ncolors++] = key;
+		}
+	}
+	if ((unsigned int)ncolors != ndist) { return 0; }
+
+	for (k = 0; k < ncolors; k++) {
+		out[o++] = (unsigned char)(palette[k] & 0xff);
+		out[o++] = (unsigned char)((palette[k] >> 8) & 0xff);
+		out[o++] = (unsigned char)((palette[k] >> 16) & 0xff);
+		if (channels == 4) {
+			out[o++] = (unsigned char)((palette[k] >> 24) & 0xff);
+		}
+	}
+
+	for (i = 0; i < npix; i++) {
+		unsigned int key = qba_pixel_key(src + (size_t)i * channels, channels);
+		for (k = 0; k < ncolors; k++) {
+			if (palette[k] == key) {
+				out[o++] = (unsigned char)k;
+				break;
+			}
+		}
+	}
+	return o;
+}
+
+static int qba_index_decode(const unsigned char *in, int in_len, int channels,
+	int npix, unsigned char *out) {
+	int ncolors, pal_bytes, i;
+	const unsigned char *palette;
+	const unsigned char *indices;
+
+	if (in_len < 1) { return -1; }
+	ncolors = in[0] + 1;
+	pal_bytes = ncolors * channels;
+	if (pal_bytes <= 0 || 1 + pal_bytes + npix != in_len) { return -1; }
+
+	palette = in + 1;
+	indices = in + 1 + pal_bytes;
+
+	for (i = 0; i < npix; i++) {
+		int k = indices[i];
+		if (k >= ncolors) { return -1; }
+		memcpy(out + (size_t)i * channels,
+			palette + (size_t)k * channels, channels);
+	}
+	return 0;
+}
+
+static void qba_fill_sentinel(unsigned char *pixels, int width, int channels,
+	int row0, int row1) {
+	int y, x;
+	for (y = row0; y < row1; y++) {
+		for (x = 0; x < width; x++) {
+			unsigned char *px = pixels +
+				((size_t)y * width + x) * channels;
+			px[0] = 255;
+			px[1] = 0;
+			px[2] = 255;
+			if (channels == 4) { px[3] = 255; }
+		}
+	}
+}
+
+void qba_default_config(qba_config *cfg) {
+	if (!cfg) { return; }
+	cfg->block_height = 16;
+	cfg->rle_threshold = 4;
+	cfg->index_colors_threshold = 32;
+}
+
+void *qba_encode(const void *data, const qoi_desc *desc,
+	const qba_config *cfg, int *out_len) {
+	qba_config defaults;
+	const unsigned char *pixels;
+	unsigned char *bytes;
+	unsigned int width, height, channels, block_height;
+	unsigned int nblocks, b, max_size;
+	int p = 0;
+
+	if (
+		data == NULL || out_len == NULL || desc == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		return NULL;
+	}
+
+	if (cfg == NULL) {
+		qba_default_config(&defaults);
+		cfg = &defaults;
+	}
+	if (
+		cfg->block_height == 0 ||
+		cfg->rle_threshold == 0 ||
+		cfg->index_colors_threshold == 0 ||
+		cfg->index_colors_threshold > 255
+	) {
+		return NULL;
+	}
+
+	width = desc->width;
+	height = desc->height;
+	channels = desc->channels;
+	block_height = cfg->block_height;
+	nblocks = (height + block_height - 1) / block_height;
+
+	if (nblocks > QBA_BLOCKS_MAX) { return NULL; }
+
+	/* Worst case: every pixel becomes its own RLE control + pixel bytes. */
+	max_size = QBA_CONTAINER_HEADER_SIZE + QBA_CONTAINER_END_SIZE +
+		nblocks * QBA_BLOCK_HEADER_SIZE +
+		(unsigned int)width * height * (channels + 1);
+
+	bytes = (unsigned char *)QOI_MALLOC(max_size);
+	if (!bytes) { return NULL; }
+	pixels = (const unsigned char *)data;
+
+	memcpy(bytes, "qba1", 4);
+	bytes[4] = QBA_VERSION;
+	bytes[5] = (unsigned char)channels;
+	bytes[6] = desc->colorspace;
+	qba_write_32(bytes + 7, width);
+	qba_write_32(bytes + 11, height);
+	qba_write_32(bytes + 15, block_height);
+	bytes[19] = (unsigned char)((cfg->rle_threshold >> 8) & 0xff);
+	bytes[20] = (unsigned char)(cfg->rle_threshold & 0xff);
+	bytes[21] = (unsigned char)((cfg->index_colors_threshold >> 8) & 0xff);
+	bytes[22] = (unsigned char)(cfg->index_colors_threshold & 0xff);
+	bytes[23] = 0;
+	p = QBA_CONTAINER_HEADER_SIZE;
+
+	for (b = 0; b < nblocks; b++) {
+		unsigned int row0 = b * block_height;
+		unsigned int row1 = row0 + block_height;
+		unsigned int rows, npix, ndist = 0, maxrun = 0;
+		const unsigned char *block_px;
+		unsigned char mode;
+		int payload_len;
+		unsigned char *hdr;
+
+		if (row1 > height) { row1 = height; }
+		rows = row1 - row0;
+		npix = width * rows;
+		block_px = pixels + (size_t)row0 * width * channels;
+
+		qba_analyze_block(block_px, channels, (int)npix, &ndist, &maxrun);
+
+		if (maxrun >= cfg->rle_threshold) {
+			mode = QBA_MODE_RLE;
+		}
+		else if (ndist <= cfg->index_colors_threshold) {
+			mode = QBA_MODE_INDEX;
+		}
+		else {
+			mode = QBA_MODE_RAW;
+		}
+
+		hdr = bytes + p;
+		hdr[0] = 'Q';
+		hdr[1] = 'B';
+		hdr[2] = mode;
+		hdr[3] = (unsigned char)((b >> 8) & 0xff);
+		hdr[4] = (unsigned char)(b & 0xff);
+		p += QBA_BLOCK_HEADER_SIZE;
+
+		if (mode == QBA_MODE_RAW) {
+			payload_len = (int)(npix * channels);
+			memcpy(bytes + p, block_px, payload_len);
+		}
+		else if (mode == QBA_MODE_RLE) {
+			payload_len = qba_rle_encode(block_px, (int)npix,
+				channels, bytes + p);
+		}
+		else {
+			payload_len = qba_index_encode(block_px, (int)npix,
+				channels, ndist, bytes + p);
+			if (payload_len == 0) { /* shouldn't happen: fall back to raw */
+				mode = QBA_MODE_RAW;
+				hdr[2] = mode;
+				payload_len = (int)(npix * channels);
+				memcpy(bytes + p, block_px, payload_len);
+			}
+		}
+
+		qba_write_32(hdr + 5, (unsigned int)payload_len);
+		hdr[9] = qba_crc8(hdr, 9);
+		p += payload_len;
+	}
+
+	memcpy(bytes + p, "QBAE", 4);
+	memset(bytes + p + 4, 0, 4);
+	p += QBA_CONTAINER_END_SIZE;
+
+	*out_len = p;
+	return bytes;
+}
+
+/* Find the next byte position holding a block marker whose header passes the
+CRC-8 check and whose block number is exactly want_block. Scanning for the
+exact next number (never a later one) prevents payload bytes that happen to
+contain a "QB" sequence from being mistaken for a block header. Returns -1
+if none. */
+
+static int qba_resync(const unsigned char *bytes, int from, int limit,
+	unsigned int want_block) {
+	int pos = from;
+	while (pos + QBA_BLOCK_HEADER_SIZE <= limit) {
+		if (bytes[pos] == 'Q' && bytes[pos + 1] == 'B') {
+			unsigned int blocknum =
+				((unsigned int)bytes[pos + 3] << 8) | bytes[pos + 4];
+			unsigned int payload_len = qba_read_32(bytes + pos + 5);
+			if (
+				pos > from &&
+				qba_crc8(bytes + pos, 9) == bytes[pos + 9] &&
+				bytes[pos + 2] <= QBA_MODE_INDEX &&
+				blocknum == want_block &&
+				(unsigned long)pos + QBA_BLOCK_HEADER_SIZE +
+					payload_len <= (unsigned long)limit
+			) {
+				return pos;
+			}
+		}
+		pos++;
+	}
+	return -1;
+}
+
+void *qba_decode(const void *data, int size, qoi_desc *desc, int channels,
+	qba_stats *stats) {
+	const unsigned char *bytes;
+	unsigned char *pixels, *work;
+	unsigned int width, height, out_channels, stored_channels;
+	unsigned int block_height, nblocks, expected, pos;
+	int stream_end;
+
+	if (
+		data == NULL || desc == NULL ||
+		(channels != 0 && channels != 3 && channels != 4) ||
+		size < QBA_CONTAINER_HEADER_SIZE + QBA_CONTAINER_END_SIZE
+	) {
+		return NULL;
+	}
+	bytes = (const unsigned char *)data;
+
+	if (memcmp(bytes, "qba1", 4) != 0 || bytes[4] != QBA_VERSION) {
+		return NULL;
+	}
+	if (bytes[5] != 3 && bytes[5] != 4) { return NULL; }
+	if (bytes[6] > 1) { return NULL; }
+
+	width = qba_read_32(bytes + 7);
+	height = qba_read_32(bytes + 11);
+	block_height = qba_read_32(bytes + 15);
+
+	if (
+		width == 0 || height == 0 || block_height == 0 ||
+		height >= QOI_PIXELS_MAX / width
+	) {
+		return NULL;
+	}
+
+	out_channels = (channels == 0) ? bytes[5] : (unsigned int)channels;
+	stored_channels = bytes[5];
+	nblocks = (height + block_height - 1) / block_height;
+
+	desc->width = width;
+	desc->height = height;
+	desc->channels = stored_channels;
+	desc->colorspace = bytes[6];
+
+	pixels = (unsigned char *)QOI_MALLOC(
+		(size_t)width * height * out_channels);
+	if (!pixels) { return NULL; }
+
+	/* Payloads are always coded with the channel count stored in the
+	stream; decode into a work buffer first, then convert. When both counts
+	match the output buffer itself is used directly. */
+	if (out_channels == stored_channels) {
+		work = pixels;
+	}
+	else {
+		work = (unsigned char *)QOI_MALLOC(
+			(size_t)width * height * stored_channels);
+		if (!work) {
+			QOI_FREE(pixels);
+			return NULL;
+		}
+	}
+
+	if (stats) { memset(stats, 0, sizeof(*stats)); }
+
+	stream_end = size - QBA_CONTAINER_END_SIZE;
+	expected = 0;
+	pos = QBA_CONTAINER_HEADER_SIZE;
+
+	while (expected < nblocks) {
+		int header_ok = 0;
+		unsigned int mode = 0, blocknum = 0, payload_len = 0;
+
+		if (pos + QBA_BLOCK_HEADER_SIZE <= (unsigned int)stream_end &&
+			bytes[pos] == 'Q' && bytes[pos + 1] == 'B' &&
+			qba_crc8(bytes + pos, 9) == bytes[pos + 9]
+		) {
+			mode = bytes[pos + 2];
+			blocknum = ((unsigned int)bytes[pos + 3] << 8) | bytes[pos + 4];
+			payload_len = qba_read_32(bytes + pos + 5);
+
+			if (
+				mode <= QBA_MODE_INDEX &&
+				blocknum == expected &&
+				(unsigned long)pos + QBA_BLOCK_HEADER_SIZE +
+					payload_len <= (unsigned long)stream_end
+			) {
+				header_ok = 1;
+			}
+		}
+
+		if (!header_ok) {
+			int next;
+
+			if (stats) { stats->corrupted_blocks++; }
+			qba_fill_sentinel(work, width, stored_channels,
+				expected * block_height,
+				(int)((expected + 1) * block_height < height ?
+					(expected + 1) * block_height : height));
+
+			/* Resync on the header of the next block number; if it cannot
+			be found, every remaining block is damaged as well. The scan
+			starts at the current header position: a header whose own CRC
+			now fails is skipped, while a still-valid header is retried. */
+			next = qba_resync(bytes, (int)pos, stream_end,
+				expected + 1);
+			if (next < 0) {
+				unsigned int b2;
+				for (b2 = expected + 1; b2 < nblocks; b2++) {
+					if (stats) { stats->corrupted_blocks++; }
+					qba_fill_sentinel(work, width, stored_channels,
+						b2 * block_height,
+						(b2 + 1) * block_height < height ?
+							(b2 + 1) * block_height : height);
+				}
+				expected = nblocks;
+				break;
+			}
+
+			pos = (unsigned int)next;
+			expected++;
+			continue;
+		}
+
+		/* Header valid: decode the payload in stored channel layout. */
+		{
+			unsigned int row0 = expected * block_height;
+			unsigned int row1 = row0 + block_height;
+			unsigned int npix;
+			unsigned char *dst;
+			int rc = 0;
+
+			if (row1 > height) { row1 = height; }
+			npix = width * (row1 - row0);
+			dst = work + (size_t)row0 * width * stored_channels;
+
+			if (mode == QBA_MODE_RAW) {
+				if (payload_len != npix * stored_channels) {
+					rc = -1;
+				}
+				else {
+					memcpy(dst, bytes + pos + QBA_BLOCK_HEADER_SIZE,
+						payload_len);
+				}
+			}
+			else if (mode == QBA_MODE_RLE) {
+				rc = qba_rle_decode(
+					bytes + pos + QBA_BLOCK_HEADER_SIZE,
+					(int)payload_len, stored_channels, (int)npix, dst);
+			}
+			else {
+				rc = qba_index_decode(
+					bytes + pos + QBA_BLOCK_HEADER_SIZE,
+					(int)payload_len, stored_channels, (int)npix, dst);
+			}
+
+			if (rc != 0) {
+				if (stats) { stats->corrupted_blocks++; }
+				qba_fill_sentinel(work, width, stored_channels,
+					row0, row1);
+			}
+			else if (stats) {
+				stats->mode_counts[mode]++;
+			}
+		}
+
+		pos += QBA_BLOCK_HEADER_SIZE + payload_len;
+		expected++;
+	}
+
+	if (stats) {
+		stats->total_blocks = nblocks;
+		stats->header_bytes = nblocks * QBA_BLOCK_HEADER_SIZE;
+	}
+
+	/* Convert stored channel layout to the requested output layout. */
+	if (work != pixels) {
+		unsigned int total = width * height;
+		unsigned int i;
+		for (i = 0; i < total; i++) {
+			const unsigned char *s = work + (size_t)i * stored_channels;
+			unsigned char *o = pixels + (size_t)i * out_channels;
+			o[0] = s[0];
+			o[1] = s[1];
+			o[2] = s[2];
+			if (out_channels == 4) {
+				o[3] = (stored_channels == 4) ? s[3] : 255;
+			}
+		}
+		QOI_FREE(work);
+	}
+
+	return pixels;
+}
 #endif /* QOI_IMPLEMENTATION */
