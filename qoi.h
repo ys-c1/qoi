@@ -69,6 +69,9 @@ struct qoi_header_t {
 	uint32_t height;     // image height in pixels (BE)
 	uint8_t  channels;   // 3 = RGB, 4 = RGBA
 	uint8_t  colorspace; // 0 = sRGB with linear alpha, 1 = all channels linear
+	                     // bit 7 (0x80, QOI_PREMULTIPLIED): set by this
+	                     // implementation when the stored image had to be
+	                     // un-premultiplied; see QOI_PREMULTIPLIED below.
 };
 
 Images are encoded row by row, left to right, top to bottom. The decoder and
@@ -81,8 +84,9 @@ Pixels are encoded as
  - a difference to the previous pixel value in r,g,b
  - full r,g,b or r,g,b,a values
 
-The color channels are assumed to not be premultiplied with the alpha channel
-("un-premultiplied alpha").
+The color channels are stored un-premultiplied ("straight alpha"). If the
+encoder detects premultiplied input it normalizes it to straight alpha and
+flags the file instead; see QOI_PREMULTIPLIED below.
 
 A running array[64] (zero-initialized) of previously seen pixel values is
 maintained by the encoder and decoder. Each pixel that is seen by the encoder
@@ -228,10 +232,21 @@ The colorspace in this qoi_desc is an enum where
 	1 = all channels are linear
 You may use the constants QOI_SRGB or QOI_LINEAR. The colorspace is purely
 informative. It will be saved to the file header, but does not affect
-how chunks are en-/decoded. */
+how chunks are en-/decoded.
+
+Bit 7 of the colorspace byte in the file header is used by this
+implementation as the QOI_PREMULTIPLIED flag: qoi_encode sets it when the
+RGBA input was detected to be premultiplied (and stores the image
+un-premultiplied, as the QOI format expects); qoi_decode then restores the
+original premultiplied pixels. The flag is handled internally and is masked
+out of qoi_desc.colorspace on decode. Note that strict QOI decoders may
+reject files that have this bit set. */
 
 #define QOI_SRGB   0
 #define QOI_LINEAR 1
+
+/* Flag bit in the colorspace byte of the file header, see above. */
+#define QOI_PREMULTIPLIED 0x80
 
 typedef struct {
 	unsigned int width;
@@ -310,6 +325,35 @@ Implementation */
 	#define QOI_ZEROARR(a) memset((a),0,sizeof(a))
 #endif
 
+/* Premultiplied-alpha auto-detection.
+
+qoi_encode examines RGBA input and classifies it as premultiplied when
+  - every pixel satisfies r,g,b <= alpha (so fully transparent pixels must
+    be black), and
+  - at least QOI_PREMULTIPLY_MIN_EDGE "edge" pixels (0 < alpha < 255) exist.
+
+Premultiplied input is stored un-premultiplied (as the QOI format expects)
+with the QOI_PREMULTIPLIED bit set in the header's colorspace byte, and
+qoi_decode reverses the transform, restoring the original pixels. The
+un-premultiply/re-premultiply pair is exactly reversible for all r,g,b <= a,
+so the round trip is lossless either way. Input that is not classified as
+premultiplied is encoded exactly as before, byte for byte.
+
+Override QOI_PREMULTIPLY_MIN_EDGE (e.g. -DQOI_PREMULTIPLY_MIN_EDGE=64) to
+require more edge-pixel evidence before classifying an image as
+premultiplied. It must be a positive integer; anything else is a compile
+time error. */
+#ifndef QOI_PREMULTIPLY_MIN_EDGE
+	#define QOI_PREMULTIPLY_MIN_EDGE 1
+#endif
+#if QOI_PREMULTIPLY_MIN_EDGE < 1
+	#error "QOI_PREMULTIPLY_MIN_EDGE must be a positive integer (>= 1)"
+#endif
+/* Catch non-integer or out-of-range thresholds that the #if above cannot. */
+typedef char qoi_premultiply_min_edge_must_be_a_positive_integer[
+	(QOI_PREMULTIPLY_MIN_EDGE >= 1 &&
+	 QOI_PREMULTIPLY_MIN_EDGE == (int)(QOI_PREMULTIPLY_MIN_EDGE)) ? 1 : -1];
+
 #define QOI_OP_INDEX  0x00 /* 00xxxxxx */
 #define QOI_OP_DIFF   0x40 /* 01xxxxxx */
 #define QOI_OP_LUMA   0x80 /* 10xxxxxx */
@@ -353,13 +397,40 @@ static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
 	return a << 24 | b << 16 | c << 8 | d;
 }
 
+/* straight -> premultiplied: p = round(s * a / 255) */
+static unsigned char qoi_premultiply_channel(unsigned int s, unsigned int a) {
+	return (unsigned char)((s * a + 127) / 255);
+}
+
+/* premultiplied -> straight: s = round(p * 255 / a). Exact inverse of
+qoi_premultiply_channel for all p <= a (and p == 0 when a == 0). */
+static unsigned char qoi_unpremultiply_channel(unsigned int p, unsigned int a) {
+	return a ? (unsigned char)((p * 255 + a / 2) / a) : 0;
+}
+
+/* Returns 1 if the RGBA buffer (px_len bytes) is classified as premultiplied:
+no pixel has a color channel larger than its alpha and at least
+QOI_PREMULTIPLY_MIN_EDGE edge pixels (0 < alpha < 255) are present. */
+static int qoi_detect_premultiplied(const unsigned char *pixels, int px_len) {
+	int i, edge = 0;
+	for (i = 0; i < px_len; i += 4) {
+		unsigned char a = pixels[i + 3];
+		if (pixels[i + 0] > a || pixels[i + 1] > a || pixels[i + 2] > a) {
+			return 0;
+		}
+		edge += (a > 0 && a < 255);
+	}
+	return edge >= QOI_PREMULTIPLY_MIN_EDGE;
+}
+
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	int i, max_size, p, run;
 	int px_len, px_end, px_pos, channels;
-	unsigned char *bytes;
+	unsigned char *bytes, *unpremul;
 	const unsigned char *pixels;
 	qoi_rgba_t index[64];
 	qoi_rgba_t px, px_prev;
+	int premultiplied;
 
 	if (
 		data == NULL || out_len == NULL || desc == NULL ||
@@ -371,6 +442,31 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 		return NULL;
 	}
 
+	px_len = desc->width * desc->height * desc->channels;
+
+	/* Detect premultiplied alpha and normalize to straight alpha for
+	storage, flagging the file with QOI_PREMULTIPLIED. Anything else takes
+	the original code path and produces the original byte stream. */
+	pixels = (const unsigned char *)data;
+	unpremul = NULL;
+	premultiplied = 0;
+	if (desc->channels == 4 && qoi_detect_premultiplied(pixels, px_len)) {
+		unpremul = (unsigned char *) QOI_MALLOC(px_len);
+		if (unpremul) {
+			for (i = 0; i < px_len; i += 4) {
+				unsigned char a = pixels[i + 3];
+				unpremul[i + 0] = qoi_unpremultiply_channel(pixels[i + 0], a);
+				unpremul[i + 1] = qoi_unpremultiply_channel(pixels[i + 1], a);
+				unpremul[i + 2] = qoi_unpremultiply_channel(pixels[i + 2], a);
+				unpremul[i + 3] = a;
+			}
+			pixels = unpremul;
+			premultiplied = 1;
+		}
+		/* On allocation failure the data is encoded as-is, without the
+		flag: still lossless, just not normalized. */
+	}
+
 	max_size =
 		desc->width * desc->height * (desc->channels + 1) +
 		QOI_HEADER_SIZE + sizeof(qoi_padding);
@@ -378,6 +474,9 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	p = 0;
 	bytes = (unsigned char *) QOI_MALLOC(max_size);
 	if (!bytes) {
+		if (unpremul) {
+			QOI_FREE(unpremul);
+		}
 		return NULL;
 	}
 
@@ -385,10 +484,8 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	qoi_write_32(bytes, &p, desc->width);
 	qoi_write_32(bytes, &p, desc->height);
 	bytes[p++] = desc->channels;
-	bytes[p++] = desc->colorspace;
+	bytes[p++] = desc->colorspace | (premultiplied ? QOI_PREMULTIPLIED : 0);
 
-
-	pixels = (const unsigned char *)data;
 
 	QOI_ZEROARR(index);
 
@@ -399,7 +496,6 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 	px_prev.rgba.a = 255;
 	px = px_prev;
 
-	px_len = desc->width * desc->height * desc->channels;
 	px_end = px_len - desc->channels;
 	channels = desc->channels;
 
@@ -481,6 +577,10 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 		bytes[p++] = qoi_padding[i];
 	}
 
+	if (unpremul) {
+		QOI_FREE(unpremul);
+	}
+
 	*out_len = p;
 	return bytes;
 }
@@ -490,9 +590,9 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	unsigned int header_magic;
 	unsigned char *pixels;
 	qoi_rgba_t index[64];
-	qoi_rgba_t px;
+	qoi_rgba_t px, px_out;
 	int px_len, chunks_len, px_pos;
-	int p = 0, run = 0;
+	int p = 0, run = 0, premultiply;
 
 	if (
 		data == NULL || desc == NULL ||
@@ -509,6 +609,12 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	desc->height = qoi_read_32(bytes, &p);
 	desc->channels = bytes[p++];
 	desc->colorspace = bytes[p++];
+
+	/* Files flagged QOI_PREMULTIPLIED store straight alpha; the original
+	premultiplied pixels are restored on output below. The flag is masked
+	out of desc->colorspace. */
+	premultiply = (desc->colorspace & QOI_PREMULTIPLIED) && desc->channels == 4;
+	desc->colorspace &= ~QOI_PREMULTIPLIED;
 
 	if (
 		desc->width == 0 || desc->height == 0 ||
@@ -577,12 +683,19 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 			index[QOI_COLOR_HASH(px) & (64 - 1)] = px;
 		}
 
-		pixels[px_pos + 0] = px.rgba.r;
-		pixels[px_pos + 1] = px.rgba.g;
-		pixels[px_pos + 2] = px.rgba.b;
-		
+		px_out = px;
+		if (premultiply) {
+			px_out.rgba.r = qoi_premultiply_channel(px.rgba.r, px.rgba.a);
+			px_out.rgba.g = qoi_premultiply_channel(px.rgba.g, px.rgba.a);
+			px_out.rgba.b = qoi_premultiply_channel(px.rgba.b, px.rgba.a);
+		}
+
+		pixels[px_pos + 0] = px_out.rgba.r;
+		pixels[px_pos + 1] = px_out.rgba.g;
+		pixels[px_pos + 2] = px_out.rgba.b;
+
 		if (channels == 4) {
-			pixels[px_pos + 3] = px.rgba.a;
+			pixels[px_pos + 3] = px_out.rgba.a;
 		}
 	}
 
