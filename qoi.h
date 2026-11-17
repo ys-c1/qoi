@@ -289,6 +289,72 @@ The returned pixel data should be free()d after use. */
 void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels);
 
 
+/* -----------------------------------------------------------------------------
+Layered (progressive pyramid) encoding -- added for thumbnail-first loading.
+
+A layered image is a container ("qpy0" magic) holding `layer_count` normal
+QOI byte streams back to back:
+
+  layer 0               : the lowest-frequency image, downsampled
+                          2^(layer_count-1) times from the original
+  layer 1..layer_count-1: high-frequency residuals relative to the previous
+                          layer. Layer i is stored at resolution 2^(L-1-i) of
+                          the original; each pixel equals the original pixel
+                          minus the nearest-neighbour upsampling of the
+                          already-decoded lower layer (mod 256).
+
+Decoding only layer 0 yields the smallest thumbnail and never touches the
+bytes of the later layers. Decoding all layers reconstructs the original
+pixels byte-for-byte, regardless of the downsampling kernel, because the
+upsampler/prediction is shared between encoder and decoder and all
+arithmetic wraps modulo 256.
+
+The downsampling kernel only affects how much the residuals compress, never
+the lossless reconstruction. The original single-layer qoi_encode() output
+is unchanged by any of this. */
+
+#define QOI_PY_LAYERS_MAX 8
+
+typedef enum {
+	QOI_PY_KERNEL_BOX = 0,      /* 2x2 average */
+	QOI_PY_KERNEL_TENT = 1,     /* separable 3-tap [1,2,1]/4 tent filter */
+	QOI_PY_KERNEL_LANCZOS2 = 2  /* separable 4-tap lanczos a=2 windowed sinc */
+} qoi_py_kernel_t;
+
+typedef struct {
+	unsigned int width;         /* full resolution width  (layer L-1) */
+	unsigned int height;        /* full resolution height (layer L-1) */
+	unsigned char channels;     /* 3 = RGB, 4 = RGBA */
+	unsigned char colorspace;   /* QOI_SRGB or QOI_LINEAR */
+	unsigned char layer_count;  /* number of layers, 1..QOI_PY_LAYERS_MAX */
+	unsigned char kernel;       /* one of qoi_py_kernel_t */
+} qoi_py_desc;
+
+
+/* Encode raw RGB/RGBA pixels into a layered container in memory.
+
+layer_count must be between 1 and QOI_PY_LAYERS_MAX (0 is an error and the
+function returns NULL). kernel selects the downsampling filter. On success
+*out_len receives the container size in bytes and the returned buffer is to
+be free()d. Returns NULL on invalid parameters or malloc failure. */
+
+void *qoi_py_encode(const void *data, const qoi_py_desc *desc, int *out_len);
+
+
+/* Decode the first `decode_layers` layers (1 = only the smallest thumbnail,
+layer_count = full resolution) from a layered container in memory.
+
+decode_layers must be between 1 and desc->layer_count. On success the qoi_py_desc
+is filled from the container header and the returned pixels have the
+resolution of the requested layer (its width/height are written back into
+desc->width/desc->height) with desc->channels bytes per pixel. Returns NULL on
+invalid parameters, truncated data or malloc failure. The returned pixel data
+should be free()d after use. */
+
+void *qoi_py_decode(const void *data, int size, qoi_py_desc *desc,
+	int decode_layers);
+
+
 #ifdef __cplusplus
 }
 #endif
@@ -646,4 +712,429 @@ void *qoi_read(const char *filename, qoi_desc *desc, int channels) {
 }
 
 #endif /* QOI_NO_STDIO */
+
+
+/* -----------------------------------------------------------------------------
+Layered (progressive pyramid) implementation.
+
+Everything below is self contained and only reuses the regular qoi_encode /
+qoi_decode above. No new headers, no external dependencies. */
+
+#define QOI_PY_MAGIC \
+	(((unsigned int)'q') << 24 | ((unsigned int)'p') << 16 | \
+	 ((unsigned int)'y') <<  8 | ((unsigned int)'0'))
+/* 3 BE uint32 (magic,width,height) = 12, then channels/colorspace/
+layer_count/kernel/reserved = 5 bytes, then one BE uint32 byte length per
+layer slot. */
+#define QOI_PY_FIXED_SIZE 17
+#define QOI_PY_HEADER_SIZE (QOI_PY_FIXED_SIZE + QOI_PY_LAYERS_MAX * 4)
+
+static unsigned int qoi_py_dim_half(unsigned int v) {
+	return (v + 1u) / 2u;
+}
+
+/* Nearest-neighbour upsample by 2, shared by the encoder (to compute
+residuals) and the decoder (to apply them). src coordinates use plain
+integer division so odd dimensions are handled deterministically. */
+static void qoi_py_upsample2(
+	const unsigned char *src, unsigned int sw, unsigned int sh,
+	unsigned char *dst, unsigned int dw, unsigned int dh, int channels
+) {
+	(void)sh;
+	for (unsigned int y = 0; y < dh; y++) {
+		const unsigned char *srow = src + (y / 2u) * sw * channels;
+		unsigned char *drow = dst + y * dw * channels;
+		for (unsigned int x = 0; x < dw; x++) {
+			const unsigned char *sp = srow + (x / 2u) * channels;
+			unsigned char *dp = drow + x * channels;
+			for (int c = 0; c < channels; c++) {
+				dp[c] = sp[c];
+			}
+		}
+	}
+}
+
+/* Downsample an image by 2 with the configurable kernel. Box and tent use
+exact integer arithmetic; lanczos2 uses fixed (double) windowed-sinc weights
+with clamped edges and rounded output. */
+static unsigned char *qoi_py_downsample2(
+	const unsigned char *src, unsigned int sw, unsigned int sh,
+	unsigned int dw, unsigned int dh, int channels, int kernel
+) {
+	unsigned char *tmp = (unsigned char *) QOI_MALLOC((size_t)dw * sh * channels);
+	unsigned char *dst = (unsigned char *) QOI_MALLOC((size_t)dw * dh * channels);
+	if (!tmp || !dst) {
+		QOI_FREE(tmp);
+		QOI_FREE(dst);
+		return NULL;
+	}
+
+	if (kernel == QOI_PY_KERNEL_BOX) {
+		/* Horizontal 1x2 average */
+		for (unsigned int y = 0; y < sh; y++) {
+			const unsigned char *srow = src + y * sw * channels;
+			unsigned char *trow = tmp + y * dw * channels;
+			for (unsigned int x = 0; x < dw; x++) {
+				unsigned int x0 = x * 2;
+				unsigned int x1 = x0 + 1; if (x1 >= sw) { x1 = x0; }
+				for (int c = 0; c < channels; c++) {
+					trow[x * channels + c] = (unsigned char)(
+						(srow[x0 * channels + c] + srow[x1 * channels + c] + 1) >> 1
+					);
+				}
+			}
+		}
+		/* Vertical 2x1 average */
+		for (unsigned int y = 0; y < dh; y++) {
+			unsigned int y0 = y * 2;
+			unsigned int y1 = y0 + 1; if (y1 >= sh) { y1 = y0; }
+			const unsigned char *r0 = tmp + y0 * dw * channels;
+			const unsigned char *r1 = tmp + y1 * dw * channels;
+			unsigned char *drow = dst + y * dw * channels;
+			for (unsigned int i = 0; i < dw * (unsigned int)channels; i++) {
+				drow[i] = (unsigned char)((r0[i] + r1[i] + 1) >> 1);
+			}
+		}
+	}
+	else if (kernel == QOI_PY_KERNEL_TENT) {
+		/* Separable [1,2,1]/4 tent, edges clamp and the clamped weight is
+		added to the centre tap so the divisor stays 4. */
+		for (unsigned int y = 0; y < sh; y++) {
+			const unsigned char *srow = src + y * sw * channels;
+			unsigned char *trow = tmp + y * dw * channels;
+			for (unsigned int x = 0; x < dw; x++) {
+				unsigned int xc = x * 2 + 1;
+				int xl = (xc > 0) ? (int)xc - 1 : 0;
+				int xr = (xc + 1 < sw) ? (int)xc + 1 : (int)xc;
+				int wl = (xc > 0) ? 1 : 0;
+				int wr = (xc + 1 < sw) ? 1 : 0;
+				int wc = 2 + (1 - wl) + (1 - wr);
+				for (int c = 0; c < channels; c++) {
+					int v = wl * srow[xl * channels + c]
+					      + wc * srow[xc * channels + c]
+					      + wr * srow[xr * channels + c];
+					trow[x * channels + c] = (unsigned char)((v + 2) >> 2);
+				}
+			}
+		}
+		for (unsigned int y = 0; y < dh; y++) {
+			unsigned int yc = y * 2 + 1;
+			int yl = (yc > 0) ? (int)yc - 1 : 0;
+			int yr = (yc + 1 < sh) ? (int)yc + 1 : (int)yc;
+			int wl = (yc > 0) ? 1 : 0;
+			int wr = (yc + 1 < sh) ? 1 : 0;
+			int wc = 2 + (1 - wl) + (1 - wr);
+			const unsigned char *rl = tmp + yl * dw * channels;
+			const unsigned char *rc = tmp + yc * dw * channels;
+			const unsigned char *rr = tmp + yr * dw * channels;
+			unsigned char *drow = dst + y * dw * channels;
+			for (unsigned int i = 0; i < dw * (unsigned int)channels; i++) {
+				int v = wl * rl[i] + wc * rc[i] + wr * rr[i];
+				drow[i] = (unsigned char)((v + 2) >> 2);
+			}
+		}
+	}
+	else {
+		/* Separable Lanczos-2 (a=2). Taps at -1.5, -0.5, 0.5, 1.5 relative to
+		the output pixel centre; weights sum to 1.0, edges clamp. */
+		static const double wts[4] = {
+			-0.12831853071795862, 0.62831853071795862,
+			 0.62831853071795862, -0.12831853071795862
+		};
+		for (unsigned int y = 0; y < sh; y++) {
+			const unsigned char *srow = src + y * sw * channels;
+			unsigned char *trow = tmp + y * dw * channels;
+			for (unsigned int x = 0; x < dw; x++) {
+				int cx = (int)x * 2 + 1;
+				int xs[4] = { cx - 2 > 0 ? cx - 2 : 0, cx - 1,
+				              cx + 1 < (int)sw ? cx + 1 : cx,
+				              cx + 2 < (int)sw ? cx + 2 : cx };
+				for (int c = 0; c < channels; c++) {
+					double v = 0;
+					for (int k = 0; k < 4; k++) {
+						v += wts[k] * srow[xs[k] * channels + c];
+					}
+					long r = (long)(v < 0 ? v - 0.5 : v + 0.5);
+					if (r < 0) { r = 0; } else if (r > 255) { r = 255; }
+					trow[x * channels + c] = (unsigned char)r;
+				}
+			}
+		}
+		for (unsigned int y = 0; y < dh; y++) {
+			int cy = (int)y * 2 + 1;
+			int ys[4] = { cy - 2 > 0 ? cy - 2 : 0, cy - 1,
+			              cy + 1 < (int)sh ? cy + 1 : cy,
+			              cy + 2 < (int)sh ? cy + 2 : cy };
+			unsigned char *drow = dst + y * dw * channels;
+			for (unsigned int x = 0; x < dw; x++) {
+				for (int c = 0; c < channels; c++) {
+					double v = 0;
+					for (int k = 0; k < 4; k++) {
+						v += wts[k] * tmp[(ys[k] * dw + x) * channels + c];
+					}
+					long r = (long)(v < 0 ? v - 0.5 : v + 0.5);
+					if (r < 0) { r = 0; } else if (r > 255) { r = 255; }
+					drow[x * channels + c] = (unsigned char)r;
+				}
+			}
+		}
+	}
+
+	QOI_FREE(tmp);
+	return dst;
+}
+
+void *qoi_py_encode(const void *data, const qoi_py_desc *desc, int *out_len) {
+	int layers, channels, kernel;
+	unsigned int dims_w[QOI_PY_LAYERS_MAX + 1];
+	unsigned int dims_h[QOI_PY_LAYERS_MAX + 1];
+	unsigned char *planes[QOI_PY_LAYERS_MAX + 1]; /* [0]=full res ... */
+	unsigned char *layer_qoi[QOI_PY_LAYERS_MAX];  /* qoi stream per layer */
+	int layer_len[QOI_PY_LAYERS_MAX];
+	unsigned char *out = NULL;
+	int total, pos;
+
+	if (
+		data == NULL || desc == NULL || out_len == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->layer_count < 1 ||
+		desc->layer_count > QOI_PY_LAYERS_MAX ||
+		desc->kernel > QOI_PY_KERNEL_LANCZOS2 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		return NULL;
+	}
+
+	layers = desc->layer_count;
+	channels = desc->channels;
+	kernel = desc->kernel;
+
+	/* Build the low-frequency pyramid. planes[0] is the original image,
+	planes[layers-1] is the smallest (layer 0 in storage order). */
+	planes[0] = (unsigned char *)data;
+	dims_w[0] = desc->width;
+	dims_h[0] = desc->height;
+	for (int i = 1; i < layers; i++) {
+		dims_w[i] = qoi_py_dim_half(dims_w[i - 1]);
+		dims_h[i] = qoi_py_dim_half(dims_h[i - 1]);
+		planes[i] = qoi_py_downsample2(
+			planes[i - 1], dims_w[i - 1], dims_h[i - 1],
+			dims_w[i], dims_h[i], channels, kernel
+		);
+		if (!planes[i]) {
+			for (int j = 1; j < i; j++) { QOI_FREE(planes[j]); }
+			return NULL;
+		}
+	}
+
+	/* Encode layers from smallest to full resolution. Layer 0 is stored as
+	raw low-frequency pixels; every later layer stores the modulo-256
+	residual against the upsampled previous layer. */
+	total = QOI_PY_HEADER_SIZE;
+	for (int li = 0; li < layers; li++) {
+		int pi = layers - 1 - li;                 /* index into planes/dims */
+		unsigned int w = dims_w[pi], h = dims_h[pi];
+		unsigned char *cur = planes[pi];
+		unsigned char *store = cur;
+		unsigned char *residual = NULL;
+		unsigned char *pred = NULL;
+
+		if (li > 0) {
+			unsigned int pw = dims_w[pi + 1], ph = dims_h[pi + 1];
+			size_t n = (size_t)w * h * channels;
+			pred = (unsigned char *) QOI_MALLOC(n);
+			residual = (unsigned char *) QOI_MALLOC(n);
+			if (!pred || !residual) {
+				QOI_FREE(pred);
+				QOI_FREE(residual);
+				for (int done = 0; done < li; done++) { QOI_FREE(layer_qoi[done]); }
+				for (int j = 1; j < layers; j++) { QOI_FREE(planes[j]); }
+				return NULL;
+			}
+			qoi_py_upsample2(planes[pi + 1], pw, ph, pred, w, h, channels);
+			for (size_t i = 0; i < n; i++) {
+				residual[i] = (unsigned char)(cur[i] - pred[i]);
+			}
+			store = residual;
+		}
+
+		qoi_desc qd = {
+			.width = w, .height = h,
+			.channels = (unsigned char)channels,
+			.colorspace = desc->colorspace
+		};
+		layer_qoi[li] = (unsigned char *) qoi_encode(store, &qd, &layer_len[li]);
+		QOI_FREE(pred);
+		QOI_FREE(residual);
+		if (!layer_qoi[li]) {
+			for (int done = 0; done < li; done++) { QOI_FREE(layer_qoi[done]); }
+			for (int j = 1; j < layers; j++) { QOI_FREE(planes[j]); }
+			return NULL;
+		}
+		total += layer_len[li];
+	}
+
+	for (int j = 1; j < layers; j++) { QOI_FREE(planes[j]); }
+
+	out = (unsigned char *) QOI_MALLOC((size_t)total);
+	if (!out) {
+		for (int li = 0; li < layers; li++) { QOI_FREE(layer_qoi[li]); }
+		return NULL;
+	}
+
+	/* Container header: fixed fields, reserved, then one BE uint32 length per
+	layer (unused slots are zero). Explicit lengths make layer boundaries
+	exact instead of scanning for the QOI end marker, which can occur inside
+	pixel data. */
+	pos = 0;
+	qoi_write_32(out, &pos, QOI_PY_MAGIC);
+	qoi_write_32(out, &pos, desc->width);
+	qoi_write_32(out, &pos, desc->height);
+	out[pos++] = desc->channels;
+	out[pos++] = desc->colorspace;
+	out[pos++] = (unsigned char)layers;
+	out[pos++] = (unsigned char)kernel;
+	out[pos++] = 0; /* reserved */
+	for (int slot = 0; slot < QOI_PY_LAYERS_MAX; slot++) {
+		qoi_write_32(out, &pos, (slot < layers)
+			? (unsigned int)layer_len[slot] : 0u);
+	}
+
+	for (int li = 0; li < layers; li++) {
+		memcpy(out + pos, layer_qoi[li], (size_t)layer_len[li]);
+		pos += layer_len[li];
+		QOI_FREE(layer_qoi[li]);
+	}
+
+	*out_len = pos;
+	return out;
+}
+
+void *qoi_py_decode(const void *data, int size, qoi_py_desc *desc,
+	int decode_layers
+) {
+	const unsigned char *bytes;
+	int p = 0;
+	unsigned int magic, full_w, full_h;
+	unsigned char channels, colorspace, layer_count, kernel;
+	unsigned int layer_len[QOI_PY_LAYERS_MAX];
+	unsigned int dims_w[QOI_PY_LAYERS_MAX + 1];
+	unsigned int dims_h[QOI_PY_LAYERS_MAX + 1];
+	unsigned char *cur = NULL;
+	unsigned int cur_w = 0, cur_h = 0;
+
+	if (data == NULL || desc == NULL || size < QOI_PY_HEADER_SIZE) {
+		return NULL;
+	}
+	bytes = (const unsigned char *)data;
+
+	magic = qoi_read_32(bytes, &p);
+	full_w = qoi_read_32(bytes, &p);
+	full_h = qoi_read_32(bytes, &p);
+	channels = bytes[p++];
+	colorspace = bytes[p++];
+	layer_count = bytes[p++];
+	kernel = bytes[p++];
+	(void)kernel; /* kernel only affects compression, not reconstruction */
+	p++; /* reserved */
+
+	if (
+		magic != QOI_PY_MAGIC || full_w == 0 || full_h == 0 ||
+		channels < 3 || channels > 4 || colorspace > 1 ||
+		layer_count < 1 || layer_count > QOI_PY_LAYERS_MAX ||
+		decode_layers < 1 || decode_layers > layer_count ||
+		full_h >= QOI_PIXELS_MAX / full_w
+	) {
+		return NULL;
+	}
+
+	/* Read the per-layer byte lengths. Only the layers actually requested
+	need to be present, so a truncated prefix still decodes up to the layer
+	it contains and fails cleanly once asked for a layer that is missing. */
+	long long need = QOI_PY_HEADER_SIZE;
+	for (int slot = 0; slot < QOI_PY_LAYERS_MAX; slot++) {
+		layer_len[slot] = qoi_read_32(bytes, &p);
+		if (slot < layer_count) {
+			if (layer_len[slot] == 0) {
+				return NULL;
+			}
+			if (slot < decode_layers) {
+				need += (long long)layer_len[slot];
+			}
+		}
+		else if (layer_len[slot] != 0) {
+			return NULL;
+		}
+	}
+	if (need > (long long)size) {
+		return NULL;
+	}
+
+	/* Resolution of each storage layer: li=0 smallest, li=layer_count-1 full */
+	dims_w[layer_count - 1] = full_w;
+	dims_h[layer_count - 1] = full_h;
+	for (int li = layer_count - 2; li >= 0; li--) {
+		dims_w[li] = qoi_py_dim_half(dims_w[li + 1]);
+		dims_h[li] = qoi_py_dim_half(dims_h[li + 1]);
+	}
+
+	int off = QOI_PY_HEADER_SIZE;
+	for (int li = 0; li < decode_layers; li++) {
+		int end = off + (int)layer_len[li];
+
+		qoi_desc qd;
+		unsigned char *layer_px = (unsigned char *) qoi_decode(
+			bytes + off, (int)layer_len[li], &qd, channels
+		);
+		if (
+			!layer_px || qd.width != dims_w[li] || qd.height != dims_h[li] ||
+			qd.channels != channels
+		) {
+			QOI_FREE(layer_px);
+			QOI_FREE(cur);
+			return NULL;
+		}
+
+		if (li == 0) {
+			cur = layer_px;
+		}
+		else {
+			size_t n = (size_t)dims_w[li] * dims_h[li] * channels;
+			unsigned char *pred = (unsigned char *) QOI_MALLOC(n);
+			unsigned char *merged = (unsigned char *) QOI_MALLOC(n);
+			if (!pred || !merged) {
+				QOI_FREE(pred);
+				QOI_FREE(merged);
+				QOI_FREE(layer_px);
+				QOI_FREE(cur);
+				return NULL;
+			}
+			qoi_py_upsample2(cur, cur_w, cur_h, pred,
+				dims_w[li], dims_h[li], channels);
+			for (size_t i = 0; i < n; i++) {
+				/* unsigned wrap matches the encoder's subtraction exactly */
+				merged[i] = (unsigned char)(pred[i] + layer_px[i]);
+			}
+			QOI_FREE(pred);
+			QOI_FREE(layer_px);
+			QOI_FREE(cur);
+			cur = merged;
+		}
+
+		cur_w = dims_w[li];
+		cur_h = dims_h[li];
+		off = end;
+	}
+
+	desc->width = cur_w;
+	desc->height = cur_h;
+	desc->channels = channels;
+	desc->colorspace = colorspace;
+	desc->layer_count = layer_count;
+	desc->kernel = kernel;
+	return cur;
+}
+
 #endif /* QOI_IMPLEMENTATION */
