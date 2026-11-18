@@ -278,6 +278,38 @@ The returned qoi data should be free()d after use. */
 void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len);
 
 
+/* Reentrant to the core: qoi_encode_ws() is a pure, reentrant variant of
+qoi_encode(). The pixel input, the image description, the output buffer and
+all encoder state are passed in explicitly. It performs no allocation and
+uses no global or static state, so any number of threads may encode
+concurrently as long as each thread uses its own workspace and output
+buffer.
+
+qoi_encode_max_size() returns the exact output buffer size that
+qoi_encode_ws() (and qoi_encode()) will ever need for the given desc, or 0
+if the desc is invalid.
+
+qoi_encode_ws() writes the encoded image into out (out_capacity must be at
+least qoi_encode_max_size(desc)) and returns the number of bytes written,
+or 0 on failure. ws is caller-provided scratch state; it is fully
+reinitialized on every call, so a workspace may be reused for any number of
+subsequent encodes. */
+
+typedef union {
+	struct { unsigned char r, g, b, a; } rgba;
+	unsigned int v;
+} qoi_rgba_t;
+
+typedef struct {
+	qoi_rgba_t index[64];
+	qoi_rgba_t px_prev;
+	int run;
+} qoi_encoder_workspace;
+
+int qoi_encode_max_size(const qoi_desc *desc);
+int qoi_encode_ws(const void *data, const qoi_desc *desc, qoi_encoder_workspace *ws, void *out, int out_capacity);
+
+
 /* Decode a QOI image from memory.
 
 The function either returns NULL on failure (invalid parameters or malloc
@@ -331,12 +363,9 @@ pixel, rounded down to a nice clean value. 400 million pixels ought to be
 enough for anybody. */
 #define QOI_PIXELS_MAX ((unsigned int)400000000)
 
-typedef union {
-	struct { unsigned char r, g, b, a; } rgba;
-	unsigned int v;
-} qoi_rgba_t;
-
-static const unsigned char qoi_padding[8] = {0,0,0,0,0,0,0,1};
+/* The encoded stream is terminated by 7 0x00 bytes followed by one 0x01
+byte. Kept as a plain macro so the implementation holds no static data. */
+#define QOI_PADDING_SIZE 8
 
 static void qoi_write_32(unsigned char *bytes, int *p, unsigned int v) {
 	bytes[(*p)++] = (0xff000000 & v) >> 24;
@@ -353,33 +382,44 @@ static unsigned int qoi_read_32(const unsigned char *bytes, int *p) {
 	return a << 24 | b << 16 | c << 8 | d;
 }
 
-void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
-	int i, max_size, p, run;
-	int px_len, px_end, px_pos, channels;
-	unsigned char *bytes;
-	const unsigned char *pixels;
-	qoi_rgba_t index[64];
-	qoi_rgba_t px, px_prev;
-
+int qoi_encode_max_size(const qoi_desc *desc) {
 	if (
-		data == NULL || out_len == NULL || desc == NULL ||
+		desc == NULL ||
 		desc->width == 0 || desc->height == 0 ||
 		desc->channels < 3 || desc->channels > 4 ||
 		desc->colorspace > 1 ||
 		desc->height >= QOI_PIXELS_MAX / desc->width
 	) {
-		return NULL;
+		return 0;
 	}
 
-	max_size =
+	return
 		desc->width * desc->height * (desc->channels + 1) +
-		QOI_HEADER_SIZE + sizeof(qoi_padding);
+		QOI_HEADER_SIZE + QOI_PADDING_SIZE;
+}
+
+int qoi_encode_ws(const void *data, const qoi_desc *desc, qoi_encoder_workspace *ws, void *out, int out_capacity) {
+	int i, p, run;
+	int px_len, px_end, px_pos, channels;
+	unsigned char *bytes;
+	const unsigned char *pixels;
+	/* The hot loop runs on this function-local copy so the compiler can
+	prove it does not alias the input/output buffers (a ws->index pointer
+	cannot be disambiguated and costs ~5% in reloads). The state is copied
+	back into the caller's workspace before returning. */
+	qoi_rgba_t index[64];
+	qoi_rgba_t px, px_prev;
+	int max_size = qoi_encode_max_size(desc);
+
+	if (
+		data == NULL || ws == NULL || out == NULL ||
+		max_size == 0 || out_capacity < max_size
+	) {
+		return 0;
+	}
 
 	p = 0;
-	bytes = (unsigned char *) QOI_MALLOC(max_size);
-	if (!bytes) {
-		return NULL;
-	}
+	bytes = (unsigned char *)out;
 
 	qoi_write_32(bytes, &p, QOI_MAGIC);
 	qoi_write_32(bytes, &p, desc->width);
@@ -477,11 +517,44 @@ void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
 		px_prev = px;
 	}
 
-	for (i = 0; i < (int)sizeof(qoi_padding); i++) {
-		bytes[p++] = qoi_padding[i];
+	memcpy(ws->index, index, sizeof(index));
+	ws->px_prev = px_prev;
+	ws->run = run;
+
+	for (i = 0; i < QOI_PADDING_SIZE - 1; i++) {
+		bytes[p++] = 0;
+	}
+	bytes[p++] = 1;
+
+	return p;
+}
+
+void *qoi_encode(const void *data, const qoi_desc *desc, int *out_len) {
+	qoi_encoder_workspace ws;
+	unsigned char *bytes;
+	int max_size, size;
+
+	if (out_len == NULL) {
+		return NULL;
 	}
 
-	*out_len = p;
+	max_size = qoi_encode_max_size(desc);
+	if (max_size == 0 || data == NULL) {
+		return NULL;
+	}
+
+	bytes = (unsigned char *) QOI_MALLOC(max_size);
+	if (!bytes) {
+		return NULL;
+	}
+
+	size = qoi_encode_ws(data, desc, &ws, bytes, max_size);
+	if (size == 0) {
+		QOI_FREE(bytes);
+		return NULL;
+	}
+
+	*out_len = size;
 	return bytes;
 }
 
@@ -497,7 +570,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	if (
 		data == NULL || desc == NULL ||
 		(channels != 0 && channels != 3 && channels != 4) ||
-		size < QOI_HEADER_SIZE + (int)sizeof(qoi_padding)
+		size < QOI_HEADER_SIZE + QOI_PADDING_SIZE
 	) {
 		return NULL;
 	}
@@ -536,7 +609,7 @@ void *qoi_decode(const void *data, int size, qoi_desc *desc, int channels) {
 	px.rgba.b = 0;
 	px.rgba.a = 255;
 
-	chunks_len = size - (int)sizeof(qoi_padding);
+	chunks_len = size - QOI_PADDING_SIZE;
 	for (px_pos = 0; px_pos < px_len; px_pos += channels) {
 		if (run > 0) {
 			run--;
