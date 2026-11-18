@@ -647,3 +647,668 @@ void *qoi_read(const char *filename, qoi_desc *desc, int channels) {
 
 #endif /* QOI_NO_STDIO */
 #endif /* QOI_IMPLEMENTATION */
+
+
+/* -----------------------------------------------------------------------------
+QOLZ - LZ77 preprocessor layer for QOI
+
+An optional, self-contained LZ77 (LZSS style) stage that sits in front of the
+QOI coding path. The compressor picks the smallest of three payloads:
+
+  mode 0: LZ77 over the raw RGBA byte stream (the preprocessor path)
+  mode 1: LZ77 over the QOI encoded stream (QOI + LZ77 fallback)
+  mode 2: raw payload stored as-is, i.e. an uncompressed "stored" block
+
+The mode is recorded in the one byte container header, so the decoder can
+restore the pixels independently of qoi_encode/qoi_decode parameter choices.
+
+LZ77 stream format (all integers little endian):
+
+  Groups of up to 8 tokens. Each group starts with one flag byte; bit 0
+  corresponds to the first token, bit 7 to the last. A 0 bit marks a literal
+  token (one raw byte follows). A 1 bit marks a match token:
+    uint16 distance, 1..65535 (backward offset in the decompressed stream)
+    uint8  len_code, match length is (len_code + 3), i.e. 3..257 bytes
+  Longer matches are emitted as several consecutive match tokens.
+
+Define QOLZ_IMPLEMENTATION together with QOI_IMPLEMENTATION in one C/C++
+file before including this header to create the implementation. The QOLZ
+layer reuses qoi_encode/qoi_decode and the QOI_MALLOC/QOI_FREE hooks, so
+QOI_IMPLEMENTATION must be defined as well.
+*/
+
+#define QOLZ_MAGIC \
+	(((unsigned int)'q') << 24 | ((unsigned int)'o') << 16 | \
+	 ((unsigned int)'l') <<  8 | ((unsigned int)'z'))
+#define QOLZ_HEADER_SIZE 15 /* 4 magic + 10 qoi fields + 1 mode */
+
+#define QOLZ_MODE_LZ_RAW 0
+#define QOLZ_MODE_LZ_QOI 1
+#define QOLZ_MODE_STORED 2
+
+typedef struct {
+	int min_match; /* minimum useful match length, clamped to >= 1 */
+	int max_chain; /* hash chain depth per search, clamped to >= 1 */
+	int nice_match; /* stop searching once a match this long is found */
+	int lazy;      /* 0 = greedy, 1 = lazy matching (one lookahead) */
+} qolz_options;
+
+/* Encode raw RGB(A) pixels into a QOLZ container in memory. Returns NULL on
+failure (invalid parameters or malloc failure) and writes the size in bytes
+to *out_len on success. The returned buffer must be free()d with QOI_FREE. */
+
+void *qolz_encode(const void *data, const qoi_desc *desc, int *out_len);
+
+/* Decode a QOLZ container from memory into RGB(A) pixels. The semantics and
+parameter conventions match qoi_decode(). */
+
+void *qolz_decode(const void *data, int size, qoi_desc *desc, int channels);
+
+
+#ifdef QOLZ_IMPLEMENTATION
+#ifndef QOLZ_IMPLEMENTATION_INCLUDED
+#define QOLZ_IMPLEMENTATION_INCLUDED
+
+#include <limits.h>
+
+#define QOLZ_WINDOW_SIZE   65535  /* maximum backward distance */
+#define QOLZ_MAX_MATCH     257    /* 3 + 254, one uint8 length code */
+#define QOLZ_HASH_BITS     16
+#define QOLZ_HASH_SIZE     (1 << QOLZ_HASH_BITS)
+#define QOLZ_NO_POS        (-1)
+/* Worst case: every byte becomes a flag bit (1/8) + a literal byte. */
+#define QOLZ_LZ_BOUND(n)   ((n) + (n) / 8 + 16)
+
+static unsigned int qolz_hash4(const unsigned char *p) {
+	unsigned int h = (unsigned int)p[0] |
+		((unsigned int)p[1] << 8) |
+		((unsigned int)p[2] << 16) |
+		((unsigned int)p[3] << 24);
+	/* Knuth multiplicative hash, keeps the low 16 bits */
+	return (h * 2654435761u) >> (32 - QOLZ_HASH_BITS);
+}
+
+/* Find the longest match for position pos by walking the hash chain. Writes
+the match distance (0 if none) and length to *out_dist / *out_len. */
+
+static void qolz_find_match(
+	const unsigned char *data, int n, int pos,
+	const int *head, const int *prev,
+	int min_match, int max_chain, int nice_match,
+	int *out_dist, int *out_len
+) {
+	int best_len = min_match - 1;
+	int best_dist = 0;
+	int max_len = n - pos;
+	int chain_count;
+	int cand;
+
+	if (max_len < min_match || pos + 3 >= n) {
+		*out_dist = 0;
+		*out_len = 0;
+		return;
+	}
+	if (max_len > QOLZ_MAX_MATCH) {
+		max_len = QOLZ_MAX_MATCH;
+	}
+
+	cand = head[qolz_hash4(data + pos)];
+	for (chain_count = 0; chain_count < max_chain && cand != QOLZ_NO_POS;
+		chain_count++
+	) {
+		int dist = pos - cand;
+		int limit;
+		int len;
+
+		/* Stale chain entry: outside the window or before the stream. */
+		if (dist <= 0 || dist > QOLZ_WINDOW_SIZE) {
+			break;
+		}
+
+		/* Cheap reject on the last byte before doing the full compare. */
+		if (
+			best_len < max_len &&
+			data[cand + best_len] == data[pos + best_len] &&
+			data[cand] == data[pos]
+		) {
+			limit = max_len;
+			len = 0;
+			while (len < limit && data[cand + len] == data[pos + len]) {
+				len++;
+			}
+			if (len > best_len) {
+				best_len = len;
+				best_dist = dist;
+				/* A match this long is "good enough": stop walking the
+				chain early to cap encoder time on repetitive data. */
+				if (len == max_len || len >= nice_match) {
+					break;
+				}
+			}
+		}
+		if (prev == NULL) {
+			break; /* head-only hash: there is no next chain entry */
+		}
+		cand = prev[cand];
+	}
+
+	*out_dist = best_dist;
+	*out_len = (best_len >= min_match) ? best_len : 0;
+	if (*out_len == 0) {
+		*out_dist = 0;
+	}
+}
+
+/* LZ77 compress `in_len` bytes from `in` into a freshly malloc'd buffer.
+Returns NULL on malloc failure or if the (bounded) output overflows. */
+
+static unsigned char *qolz_lz_compress(
+	const unsigned char *in, int in_len,
+	int min_match, int max_chain, int nice_match, int lazy,
+	int *out_len
+) {
+	int *head;
+	int *prev;
+	unsigned char *out;
+	int out_cap;
+	int pos = 0;
+	int out_p = 0;
+	int flag_p = 0;
+	int flags = 0;
+	int token_n = 0; /* tokens already emitted in the current flag group */
+	int hash_pos;
+	int match_len = 0;
+	int match_dist = 0;
+
+	if (min_match < 1) { min_match = 1; }
+	if (max_chain < 1) { max_chain = 1; }
+	if (nice_match < 3) { nice_match = 3; }
+	lazy = lazy ? 1 : 0;
+
+	out_cap = QOLZ_LZ_BOUND(in_len);
+	out = (unsigned char *) QOI_MALLOC((size_t)out_cap);
+	head = (int *) QOI_MALLOC(sizeof(int) * QOLZ_HASH_SIZE);
+	/* With a chain depth of one the link array is never read: the hash
+	table alone is enough, which avoids an O(n) allocation and an O(n)
+	stream of random writes on every compression. */
+	prev = (max_chain > 1)
+		? (int *) QOI_MALLOC(sizeof(int) * (size_t)(in_len ? in_len : 1))
+		: NULL;
+	if (!out || !head || (max_chain > 1 && !prev)) {
+		QOI_FREE(out);
+		QOI_FREE(head);
+		QOI_FREE(prev);
+		return NULL;
+	}
+	memset(head, 0xff, sizeof(int) * QOLZ_HASH_SIZE); /* QOLZ_NO_POS */
+
+	/* Reserve the flag byte for the next token and close the previous
+	group once it holds 8 tokens. Every emitted token goes through here,
+	so flag accounting can never drift from the actual token stream. */
+	#define LZ_BEGIN_TOKEN() do { \
+		if (token_n == 0) { \
+			if (out_p + 1 >= out_cap) { goto fail; } \
+			flag_p = out_p; \
+			out_p++; \
+		} \
+	} while (0)
+	#define LZ_END_TOKEN(is_match) do { \
+		if (is_match) { flags |= (1 << token_n); } \
+		token_n++; \
+		if (token_n == 8) { \
+			out[flag_p] = (unsigned char)flags; \
+			flags = 0; \
+			token_n = 0; \
+		} \
+	} while (0)
+
+	/* pos advances by one on every literal and by the match length on
+	every match token, so an input without matches only emits literals and
+	always terminates. */
+	for (;;) {
+		int cur_len = 0, cur_dist = 0;
+
+		if (pos >= in_len) {
+			break;
+		}
+
+		qolz_find_match(in, in_len, pos, head, prev,
+			min_match, max_chain, nice_match, &cur_dist, &cur_len);
+
+		if (lazy && match_len > 0 && pos > 0) {
+			/* A match is pending from the previous position. Emit it
+			unless the match found here is strictly better. */
+			if (cur_len > match_len + 1) {
+				/* Demote the pending match start to a literal and keep
+				the current match pending for the next round. */
+				LZ_BEGIN_TOKEN();
+				if (out_p >= out_cap) { goto fail; }
+				out[out_p++] = in[pos - 1];
+				LZ_END_TOKEN(0);
+
+				if (pos - 1 + 4 <= in_len) {
+					unsigned int h = qolz_hash4(in + (pos - 1));
+					if (prev) { prev[pos - 1] = head[h]; }
+					head[h] = pos - 1;
+				}
+				match_len = cur_len;
+				match_dist = cur_dist;
+				pos++;
+				continue;
+			}
+			else {
+				/* Emit the pending match; it starts at pos - 1. */
+				int start = pos - 1;
+				int i;
+				LZ_BEGIN_TOKEN();
+				if (out_p + 3 >= out_cap) { goto fail; }
+				out[out_p++] = (unsigned char)(match_dist & 0xff);
+				out[out_p++] = (unsigned char)((match_dist >> 8) & 0xff);
+				out[out_p++] = (unsigned char)(match_len - 3);
+				LZ_END_TOKEN(1);
+				for (i = 0; i < match_len; i++) {
+					hash_pos = start + i;
+					if (hash_pos + 4 <= in_len) {
+						unsigned int h = qolz_hash4(in + hash_pos);
+						if (prev) { prev[hash_pos] = head[h]; }
+						head[h] = hash_pos;
+					}
+				}
+				pos = start + match_len;
+				match_len = 0;
+				match_dist = 0;
+				continue;
+			}
+		}
+
+		/* A 1-2 byte match cannot pay for its 3 byte token; only matches
+		of at least 3 bytes are ever emitted. This also makes min_match=1
+		degenerate to ordinary literal/match(>=3) coding. */
+		if (cur_len >= 3 && lazy) {
+			/* Hold the match and look one position ahead next round. */
+			match_len = cur_len;
+			match_dist = cur_dist;
+			pos++;
+			continue;
+		}
+		else if (cur_len >= 3) {
+			int i;
+			LZ_BEGIN_TOKEN();
+			if (out_p + 3 >= out_cap) { goto fail; }
+			out[out_p++] = (unsigned char)(cur_dist & 0xff);
+			out[out_p++] = (unsigned char)((cur_dist >> 8) & 0xff);
+			out[out_p++] = (unsigned char)(cur_len - 3);
+			LZ_END_TOKEN(1);
+			for (i = 0; i < cur_len; i++) {
+				hash_pos = pos + i;
+				if (hash_pos + 4 <= in_len) {
+					unsigned int h = qolz_hash4(in + hash_pos);
+					if (prev) { prev[hash_pos] = head[h]; }
+					head[h] = hash_pos;
+				}
+			}
+			pos += cur_len;
+		}
+		else {
+			LZ_BEGIN_TOKEN();
+			if (out_p >= out_cap) { goto fail; }
+			out[out_p++] = in[pos];
+			LZ_END_TOKEN(0);
+			if (pos + 4 <= in_len) {
+				unsigned int h = qolz_hash4(in + pos);
+				if (prev) { prev[pos] = head[h]; }
+				head[h] = pos;
+			}
+			pos++;
+		}
+	}
+
+	/* Flush a match still pending at end of input. */
+	if (match_len > 0) {
+		int start = pos - 1;
+		int i;
+		LZ_BEGIN_TOKEN();
+		if (out_p + 3 >= out_cap) { goto fail; }
+		out[out_p++] = (unsigned char)(match_dist & 0xff);
+		out[out_p++] = (unsigned char)((match_dist >> 8) & 0xff);
+		out[out_p++] = (unsigned char)(match_len - 3);
+		LZ_END_TOKEN(1);
+		for (i = 0; i < match_len; i++) {
+			hash_pos = start + i;
+			if (hash_pos + 4 <= in_len) {
+				unsigned int h = qolz_hash4(in + hash_pos);
+				if (prev) { prev[hash_pos] = head[h]; }
+				head[h] = hash_pos;
+			}
+		}
+		pos = start + match_len;
+	}
+	if (token_n > 0) {
+		out[flag_p] = (unsigned char)flags;
+	}
+
+	#undef LZ_BEGIN_TOKEN
+	#undef LZ_END_TOKEN
+
+	if (pos != in_len) {
+		goto fail;
+	}
+	QOI_FREE(head);
+	QOI_FREE(prev);
+	*out_len = out_p;
+	return out;
+
+fail:
+	QOI_FREE(out);
+	QOI_FREE(head);
+	QOI_FREE(prev);
+	return NULL;
+}
+
+/* Decompress an LZ77 stream produced by qolz_lz_compress into a freshly
+malloc'd buffer. If expected_len > 0 the decompressed output must have
+exactly that many bytes; if expected_len == 0 the output ends when the input
+is fully consumed. The whole input must always be consumed. Returns NULL on
+malloc failure or on any malformed/truncated input. */
+
+static unsigned char *qolz_lz_decompress(
+	const unsigned char *in, int in_len, int dst_cap, int expected_len,
+	int *out_actual
+) {
+	unsigned char *dst;
+	int in_p = 0;
+	int out_p = 0;
+	unsigned char flags = 0;
+	int bit = 8; /* force a flag byte read on the first iteration */
+
+	if (dst_cap < 0 || in_len < 0 || expected_len < 0 ||
+		expected_len > dst_cap
+	) {
+		return NULL;
+	}
+	dst = (unsigned char *) QOI_MALLOC((size_t)dst_cap ? (size_t)dst_cap : 1);
+	if (!dst) {
+		return NULL;
+	}
+
+	/* With expected_len > 0 exactly that many output bytes must be
+	produced. With expected_len == 0 the output ends when the whole input
+	has been consumed. A flag byte only governs the following 8 tokens,
+	and the last group may use fewer than 8. */
+	while (
+		out_p < dst_cap &&
+		(expected_len == 0 ? in_p < in_len : out_p < expected_len)
+	) {
+		int is_match;
+
+		if (bit == 8) {
+			if (in_p >= in_len) { goto fail; }
+			flags = in[in_p++];
+			bit = 0;
+		}
+		is_match = (flags >> bit) & 1;
+		bit++;
+
+		if (!is_match) {
+			if (in_p >= in_len) { goto fail; }
+			dst[out_p++] = in[in_p++];
+		}
+		else {
+			int dist, len, i;
+			if (in_p + 3 > in_len) { goto fail; }
+			dist = in[in_p] | (in[in_p + 1] << 8);
+			len = in[in_p + 2] + 3;
+			in_p += 3;
+			if (
+				dist < 1 || dist > QOLZ_WINDOW_SIZE ||
+				dist > out_p || len > QOLZ_MAX_MATCH ||
+				len > dst_cap - out_p
+			) {
+				goto fail;
+			}
+			for (i = 0; i < len; i++) {
+				dst[out_p] = dst[out_p - dist];
+				out_p++;
+			}
+		}
+	}
+
+	if (in_p != in_len) {
+		goto fail;
+	}
+	if (expected_len > 0 && out_p != expected_len) {
+		goto fail;
+	}
+	if (out_actual) {
+		*out_actual = out_p;
+	}
+	return dst;
+
+fail:
+	QOI_FREE(dst);
+	return NULL;
+}
+
+void *qolz_encode(const void *data, const qoi_desc *desc, int *out_len) {
+	unsigned char *raw;
+	unsigned char *qoi = NULL;
+	unsigned char *lz_qoi = NULL;
+	unsigned char *payload;
+	unsigned char *out;
+	int qoi_len, lz_qoi_len;
+	int px_len, out_cap, p = 0;
+	int mode;
+	unsigned int pixels;
+
+	/* Default LZ77 tuning. Greedy matching with a single-entry (head-only)
+	hash keeps the encoder well inside the time budget; the ratio cost
+	versus a deep lazy chain is small. The deeper chain, nice_match and
+	lazy knobs remain available through qolz_lz_compress(). */
+	const int min_match = 3;
+	const int max_chain = 1;
+	const int nice_match = 32;
+	const int lazy = 0;
+
+	if (
+		data == NULL || out_len == NULL || desc == NULL ||
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		return NULL;
+	}
+
+	pixels = desc->width * desc->height;
+	if (pixels > (unsigned int)INT_MAX / desc->channels) {
+		return NULL;
+	}
+	px_len = (int)pixels * desc->channels;
+
+	raw = (unsigned char *) QOI_MALLOC((size_t)px_len);
+	if (!raw) {
+		return NULL;
+	}
+	memcpy(raw, data, (size_t)px_len);
+
+	/* Stored (mode 2) is the guaranteed upper bound: the payload is never
+	larger than the raw pixel stream. */
+	mode = QOLZ_MODE_STORED;
+	payload = raw;
+	out_cap = px_len;
+
+	qoi = (unsigned char *) qoi_encode(raw, desc, &qoi_len);
+
+	/* Only spend an LZ77 pass when QOI actually made the stream smaller.
+	On incompressible material (noise) QOI is already >= raw size and LZ
+	cannot win, so skipping it avoids a pointless O(n) search. */
+	if (qoi && qoi_len < px_len) {
+		lz_qoi = qolz_lz_compress(qoi, qoi_len,
+			min_match, max_chain, nice_match, lazy, &lz_qoi_len);
+		if (lz_qoi && lz_qoi_len < out_cap) {
+			mode = QOLZ_MODE_LZ_QOI;
+			payload = lz_qoi;
+			out_cap = lz_qoi_len;
+		}
+	}
+
+	out = (unsigned char *) QOI_MALLOC((size_t)QOLZ_HEADER_SIZE + (size_t)out_cap);
+	if (!out) {
+		QOI_FREE(raw);
+		QOI_FREE(qoi);
+		QOI_FREE(lz_qoi);
+		return NULL;
+	}
+
+	{
+		int hp = 0;
+		qoi_write_32(out, &hp, QOLZ_MAGIC);
+		qoi_write_32(out, &hp, desc->width);
+		qoi_write_32(out, &hp, desc->height);
+		out[hp++] = desc->channels;
+		out[hp++] = desc->colorspace;
+		out[hp++] = (unsigned char)mode;
+	}
+	memcpy(out + QOLZ_HEADER_SIZE, payload, (size_t)out_cap);
+	p = QOLZ_HEADER_SIZE + out_cap;
+
+	QOI_FREE(raw);
+	QOI_FREE(qoi);
+	QOI_FREE(lz_qoi);
+
+	*out_len = p;
+	return out;
+}
+
+void *qolz_decode(const void *data, int size, qoi_desc *desc, int channels) {
+	const unsigned char *bytes;
+	unsigned int header_magic;
+	unsigned char mode;
+	int p = 0;
+	int payload_len;
+	unsigned char *buf = NULL;
+	unsigned char *pixels;
+
+	if (
+		data == NULL || desc == NULL ||
+		(channels != 0 && channels != 3 && channels != 4) ||
+		size < QOLZ_HEADER_SIZE
+	) {
+		return NULL;
+	}
+	bytes = (const unsigned char *)data;
+
+	header_magic = qoi_read_32(bytes, &p);
+	desc->width = qoi_read_32(bytes, &p);
+	desc->height = qoi_read_32(bytes, &p);
+	desc->channels = bytes[p++];
+	desc->colorspace = bytes[p++];
+	mode = bytes[p++];
+
+	if (
+		desc->width == 0 || desc->height == 0 ||
+		desc->channels < 3 || desc->channels > 4 ||
+		desc->colorspace > 1 ||
+		header_magic != QOLZ_MAGIC ||
+		desc->height >= QOI_PIXELS_MAX / desc->width
+	) {
+		return NULL;
+	}
+
+	if (channels == 0) {
+		channels = desc->channels;
+	}
+
+	payload_len = size - QOLZ_HEADER_SIZE;
+
+	if (mode == QOLZ_MODE_STORED) {
+		int stored_len = (int)(desc->width * desc->height) * desc->channels;
+		if (payload_len != stored_len) {
+			return NULL;
+		}
+		buf = (unsigned char *) QOI_MALLOC((size_t)stored_len);
+		if (!buf) {
+			return NULL;
+		}
+		memcpy(buf, bytes + QOLZ_HEADER_SIZE, (size_t)stored_len);
+	}
+	else if (mode == QOLZ_MODE_LZ_RAW) {
+		int raw_len = (int)(desc->width * desc->height) * desc->channels;
+		buf = qolz_lz_decompress(bytes + QOLZ_HEADER_SIZE,
+			payload_len, raw_len, raw_len, NULL);
+		if (!buf) {
+			return NULL;
+		}
+	}
+	else if (mode == QOLZ_MODE_LZ_QOI) {
+		qoi_desc inner;
+		int inner_p = 0;
+		int qoi_cap;
+		int actual_len = 0;
+		unsigned int inner_magic;
+
+		/* The payload is an LZ77 stream whose *decompressed* bytes form an
+		ordinary QOI stream. Bound the output with the container header,
+		decompress first, then validate the QOI header from real bytes. */
+		qoi_cap = (int)desc->width * (int)desc->height *
+			(desc->channels + 1) + QOI_HEADER_SIZE +
+			(int)sizeof(qoi_padding);
+
+		buf = qolz_lz_decompress(bytes + QOLZ_HEADER_SIZE,
+			payload_len, qoi_cap, 0, &actual_len);
+		if (!buf || actual_len < QOI_HEADER_SIZE +
+			(int)sizeof(qoi_padding)) {
+			QOI_FREE(buf);
+			return NULL;
+		}
+
+		inner_magic = qoi_read_32(buf, &inner_p);
+		inner.width = qoi_read_32(buf, &inner_p);
+		inner.height = qoi_read_32(buf, &inner_p);
+		inner.channels = buf[inner_p++];
+		inner.colorspace = buf[inner_p++];
+		if (
+			inner_magic != QOI_MAGIC ||
+			inner.width != desc->width ||
+			inner.height != desc->height ||
+			inner.channels != desc->channels
+		) {
+			QOI_FREE(buf);
+			return NULL;
+		}
+
+		pixels = (unsigned char *) qoi_decode(buf, actual_len,
+			&inner, channels);
+		QOI_FREE(buf);
+		return pixels;
+	}
+	else {
+		return NULL;
+	}
+
+	if (channels == desc->channels) {
+		return buf;
+	}
+	/* Channel count conversion is handled by reusing QOI: wrap through a
+	QOI round trip on the restored raw pixels. */
+	{
+		qoi_desc raw_desc = *desc;
+		unsigned char *qoi_buf;
+		int qoi_len;
+		qoi_desc ignored;
+		raw_desc.channels = desc->channels;
+		qoi_buf = (unsigned char *) qoi_encode(buf, &raw_desc, &qoi_len);
+		if (!qoi_buf) {
+			QOI_FREE(buf);
+			return NULL;
+		}
+		pixels = (unsigned char *) qoi_decode(qoi_buf, qoi_len,
+			&ignored, channels);
+		QOI_FREE(qoi_buf);
+		QOI_FREE(buf);
+		return pixels;
+	}
+}
+
+#endif /* QOLZ_IMPLEMENTATION_INCLUDED */
+#endif /* QOLZ_IMPLEMENTATION */
